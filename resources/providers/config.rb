@@ -13,6 +13,11 @@ action :add do
     install_dir = node['cinc-server']['install_dir']
     config_dir = node['cinc-server']['config_dir']
     cinc_user = node['cinc-server']['user']
+    # on-premise S3 keeps its keys in OpenBao, not in the data bag (nil while OpenBao is locked)
+    s3_secrets = s3_secrets.merge(OpenBao.run_secret('s3') || {}) unless s3_secrets['s3_secret_key_id']
+    run_secrets = '/run/rb-secrets/cinc-server/private-cinc-secrets.json'
+    etc_secrets = "#{config_dir}/private-cinc-secrets.json"
+    units = %w(opscode-erchef opscode-nginx opscode-redis_lb opscode-oc_bifrost opscode-oc_id opscode-bookshelf)
 
     # Keep cinc-server-ctl working on nodes where RVM exports its Ruby environment.
     # chef-server-ctl is kept as an alias because redborder-manager scripts still call it.
@@ -31,11 +36,53 @@ action :add do
       action ::File.directory?('/var/chef') ? :create : :delete
     end
 
+    # created here: the agent's file needs it before cinc-server-ctl reconfigure
+    user cinc_user do
+      system true
+      shell '/usr/sbin/nologin'
+      home "#{install_dir}/embedded"
+    end
+
+    group cinc_user do
+      members [cinc_user]
+    end
+
+    openbao_secret_file 'cinc-server' do
+      source 'cinc-server-secrets.json.ctmpl.erb'
+      cookbook 'cinc-server'
+      destination run_secrets
+      owner cinc_user
+      group cinc_user
+      mode '0600'
+      unit units
+      # no restart: rb_cinc_server_ctl applies changes itself
+      restart false
+      action :add
+    end
+
+    execute 'cinc-server-secrets-daemon-reload' do
+      command 'systemctl daemon-reload'
+      action :nothing
+    end
+
+    units.each do |unit|
+      file "/etc/systemd/system/#{unit}.service.d/51-cinc-server-secrets.conf" do
+        content "[Service]\nEnvironment=CHEF_SECRETS_FILE=#{run_secrets}\n"
+        action :create
+        notifies :run, 'execute[cinc-server-secrets-daemon-reload]', :immediately
+      end
+    end
+
+    execute 'Remove the cinc-server secrets file from disk' do
+      command "shred -u #{etc_secrets}"
+      only_if { ::File.size?(run_secrets) && ::File.exist?(etc_secrets) && ::FileUtils.compare_file(etc_secrets, run_secrets) }
+    end
+
     # Chef Server is still installed: the switch to Cinc is done by rb_migrate_to_cinc.sh, not here
     if ::File.directory?('/opt/opscode') && !::File.directory?(install_dir)
       Chef::Log.warn('Chef Server (/opt/opscode) is still installed. Run rb_migrate_to_cinc.sh to migrate to Cinc.')
     # Only executed if it's a custom node with cinc-server
-    elsif !::File.directory?(install_dir) && !node['cinc-server']['installed']
+    elsif !::File.directory?(install_dir) && !node['cinc-server']['installed'] && ::File.size?(run_secrets)
 
       Chef::Log.info('Installing cinc-server services')
       # install cinc-server package
@@ -49,17 +96,29 @@ action :add do
         mode '0755'
       end
 
-      execute 'Set 4443 as cinc-server proxy SSL default port' do
-        command "echo \"nginx['ssl_port'] = 4443\" >> #{config_dir}/cinc-server.rb"
+      lines = ["nginx['ssl_port'] = 4443", "nginx['non_ssl_port'] = 4080", 'insecure_addon_compat false']
+      # same external services as the leader: without them reconfigure starts its own PostgreSQL on 5432
+      lines += ["postgresql['db_superuser'] = \"postgres\"",
+                "postgresql['external'] = true",
+                "postgresql['port'] = 5432",
+                "postgresql['vip'] = \"master.postgresql.service\""]
+      if s3_secrets['s3_host']
+        lines += ["bookshelf['enable'] = false",
+                  "bookshelf['vip'] = \"#{s3_secrets['s3_host']}\"",
+                  "bookshelf['external_url'] = \"#{s3_secrets['s3_external_url'] || "https://#{s3_secrets['s3_host']}"}\"",
+                  "opscode_erchef['s3_bucket'] = \"#{s3_secrets['s3_bucket']}\"",
+                  "opscode_erchef['s3_url_type'] = \"path\""]
+      end
+      ruby_block 'Cinc proxy ports and external services in cinc-server.rb' do
+        block do
+          current = ::File.exist?("#{config_dir}/cinc-server.rb") ? ::File.read("#{config_dir}/cinc-server.rb") : ''
+          ::File.open("#{config_dir}/cinc-server.rb", 'a') { |f| lines.each { |l| f.puts l unless current.include?(l) } }
+        end
       end
 
-      execute 'Set 4080 as cinc-server proxy non SSL default port' do
-        command "echo \"nginx['non_ssl_port'] = 4080\" >> #{config_dir}/cinc-server.rb"
-      end
-
-      # cinc-server reconfigure (Cinc has no license to accept)
+      # Cinc has no license to accept
       execute 'Configuring cinc-server' do
-        command '/usr/local/bin/cinc-server-ctl reconfigure &>> /root/.install-cinc-server.log'
+        command '/usr/lib/redborder/bin/rb_cinc_server_ctl reconfigure &>> /root/.install-cinc-server.log'
       end
 
       file "#{config_dir}/private-cinc-secrets.json" do
@@ -119,7 +178,7 @@ action :add do
           end
         end
 
-        unless s3_secrets.empty?
+        if s3_secrets['s3_secret_key_id']
           Chef::Log.info('Configuring cinc-server cookbook storage')
           s3_access_key_id = s3_secrets['s3_access_key_id']
           s3_secret_key_id = s3_secrets['s3_secret_key_id']
@@ -201,6 +260,22 @@ end
 
 action :remove do
   begin
+    units = %w(opscode-erchef opscode-nginx opscode-redis_lb opscode-oc_bifrost opscode-oc_id opscode-bookshelf)
+    openbao_secret_file 'cinc-server' do
+      source 'cinc-server-secrets.json.ctmpl.erb'
+      cookbook 'cinc-server'
+      destination '/run/rb-secrets/cinc-server/private-cinc-secrets.json'
+      unit units
+      action :remove
+    end
+
+    units.each do |unit|
+      file "/etc/systemd/system/#{unit}.service.d/51-cinc-server-secrets.conf" do
+        action :delete
+      end
+    end
+    execute 'systemctl daemon-reload'
+
     Chef::Log.info('cinc-server cookbook has been processed')
   rescue => e
     Chef::Log.error(e.message)
@@ -211,7 +286,7 @@ action :register do
   begin
     ipaddress = new_resource.ipaddress
     consul_servers = system('serf members -tag consul=ready | grep consul=ready &> /dev/null')
-    unless node['cinc-server']['registered'] && consul_servers
+    if ::File.directory?(node['cinc-server']['install_dir']) && !(node['cinc-server']['registered'] && consul_servers)
       query = {}
       query['ID'] = "erchef-#{node['hostname']}"
       query['Name'] = 'erchef'
